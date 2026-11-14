@@ -2,16 +2,80 @@
 from flask import Flask, request
 import requests
 import os
+import psycopg2
 
 app = Flask(__name__)
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 BASE_URL = os.getenv("RENDER_EXTERNAL_URL")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 API = f"https://api.telegram.org/bot{TOKEN}"
 
 
+# DATABASE CONNECTION
+def save_user(user):
+    if not DATABASE_URL:
+        print("DATABASE_URL is missing")
+        return False
+
+    try:
+        db_url = DATABASE_URL.replace(
+            "postgres://", "postgresql://", 1
+        )
+
+        conn = psycopg2.connect(
+            db_url,
+            connect_timeout=10
+        )
+
+        cur = conn.cursor()
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS customers (
+                telegram_id BIGINT PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                last_seen TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+
+        cur.execute("""
+            INSERT INTO customers
+            (telegram_id, username, first_name, last_name)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (telegram_id)
+            DO UPDATE SET
+                username = EXCLUDED.username,
+                first_name = EXCLUDED.first_name,
+                last_name = EXCLUDED.last_name,
+                last_seen = NOW()
+        """, (
+            user.get("id"),
+            user.get("username"),
+            user.get("first_name"),
+            user.get("last_name")
+        ))
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        print("Customer saved:", user.get("id"))
+        return True
+
+    except Exception as error:
+        print("Database error:", error)
+        return False
+
+
+# SEND TELEGRAM MESSAGE
 def send_message(chat_id, text, keyboard=None):
+    if not TOKEN:
+        return
+
     payload = {
         "chat_id": chat_id,
         "text": text
@@ -41,6 +105,7 @@ def answer_callback(callback_id):
         print("Callback error:", error)
 
 
+# MAIN MENU
 def main_menu(chat_id):
     keyboard = {
         "inline_keyboard": [
@@ -76,9 +141,11 @@ def submenu(chat_id, title, buttons):
             [{"text": "⬅️ Main Menu", "callback_data": "back_menu"}]
         ]
     }
+
     send_message(chat_id, title, keyboard)
 
 
+# BUTTON ACTIONS
 def handle_choice(chat_id, choice):
 
     if choice == "accounts":
@@ -94,13 +161,13 @@ def handle_choice(chat_id, choice):
     elif choice == "business_app":
         send_message(
             chat_id,
-            "📱 WhatsApp Business selected!\n\nOfficial Cloud API and eligible Coexistence connection setup will be added next.\n\nNo account has been connected yet."
+            "📱 WhatsApp Business selected!\n\nOfficial Cloud API and eligible Coexistence connection setup will be added next. No account has been connected yet."
         )
 
     elif choice == "personal_whatsapp":
         send_message(
             chat_id,
-            "💬 Normal WhatsApp selected!\n\nPersonal WhatsApp does not offer an official bulk messaging API. We can use personal WhatsApp numbers as contact recipients, but cannot promise official personal-account bulk sending."
+            "💬 Normal WhatsApp selected!\n\nPersonal WhatsApp does not offer an official bulk messaging API. We can use personal WhatsApp numbers as contacts, but cannot promise official personal-account bulk sending."
         )
 
     elif choice == "contacts":
@@ -116,25 +183,25 @@ def handle_choice(chat_id, choice):
     elif choice == "add_contact":
         send_message(
             chat_id,
-            "➕ ADD CONTACT\n\nContact entry and consent verification will be set up next."
+            "➕ Add Contact feature will be connected next."
         )
 
     elif choice == "view_contacts":
         send_message(
             chat_id,
-            "📋 Your contact database is not configured yet."
+            "📋 Contact database setup is coming next."
         )
 
     elif choice == "excel":
         send_message(
             chat_id,
-            "📤 EXCEL UPLOAD\n\nSend an Excel file (.xlsx) in a future upload step. File processing is not active yet."
+            "📤 EXCEL UPLOAD\n\nExcel contact upload will be connected next."
         )
 
     elif choice == "broadcast":
         submenu(
             chat_id,
-            "🚀 CREATE BROADCAST\n\nChoose a campaign option:",
+            "🚀 CREATE BROADCAST\n\nChoose an option:",
             [
                 [{"text": "✍️ Create New Campaign", "callback_data": "new_campaign"}],
                 [{"text": "📊 Campaign Status", "callback_data": "history"}]
@@ -144,7 +211,7 @@ def handle_choice(chat_id, choice):
     elif choice == "new_campaign":
         send_message(
             chat_id,
-            "🚀 NEW CAMPAIGN\n\nCampaign creation will be connected after WhatsApp account and contact setup."
+            "🚀 Campaign creation will be connected after account and contact setup."
         )
 
     elif choice == "autoreply":
@@ -160,7 +227,7 @@ def handle_choice(chat_id, choice):
     elif choice == "add_reply":
         send_message(
             chat_id,
-            "🤖 Add Auto Reply feature will be configured next."
+            "🤖 Auto Reply setup is coming next."
         )
 
     elif choice == "view_replies":
@@ -172,7 +239,7 @@ def handle_choice(chat_id, choice):
     elif choice == "credits":
         submenu(
             chat_id,
-            "💳 CREDITS & PLANS\n\nSubscription plans will be available here:",
+            "💳 CREDITS & PLANS\n\nChoose a plan:",
             [
                 [{"text": "🥉 Basic Plan", "callback_data": "basic_plan"}],
                 [{"text": "🥈 Pro Plan", "callback_data": "pro_plan"}],
@@ -183,20 +250,20 @@ def handle_choice(chat_id, choice):
     elif choice in ["basic_plan", "pro_plan", "business_plan"]:
         send_message(
             chat_id,
-            "💳 Plan selected: " + choice.replace("_", " ").title()
-            + "\n\nPayment and credit system will be connected later."
+            "💳 Selected: " + choice.replace("_", " ").title()
+            + "\n\nPayment and credits will be connected later."
         )
 
     elif choice == "history":
         send_message(
             chat_id,
-            "📜 CAMPAIGN HISTORY\n\nYour campaign database is not configured yet."
+            "📜 Campaign history will be connected next."
         )
 
     elif choice == "help":
         send_message(
             chat_id,
-            "❓ HELP & SUPPORT\n\nWelcome to My WP Broadcaster!\n\nUse the main menu to explore the bot. More features are coming soon."
+            "❓ HELP & SUPPORT\n\nWelcome to My WP Broadcaster!\n\nUse the menu to explore the bot."
         )
 
     elif choice == "back_menu":
@@ -206,11 +273,13 @@ def handle_choice(chat_id, choice):
         send_message(chat_id, "Please choose an option from the menu.")
 
 
+# HOME PAGE
 @app.route("/")
 def home():
     return "My WP Broadcaster Bot is Running!"
 
 
+# TELEGRAM WEBHOOK
 @app.route("/telegram", methods=["POST"])
 def telegram():
     data = request.get_json(silent=True) or {}
@@ -221,11 +290,13 @@ def telegram():
     if message:
         chat_id = message.get("chat", {}).get("id")
         text = message.get("text", "")
+        user = message.get("from", {})
+
+        if chat_id and user:
+            save_user(user)
 
         if chat_id and text:
-            if text == "/start":
-                main_menu(chat_id)
-            elif text == "/menu":
+            if text in ["/start", "/menu"]:
                 main_menu(chat_id)
             else:
                 send_message(
@@ -235,8 +306,12 @@ def telegram():
 
     if callback:
         callback_id = callback.get("id")
+        user = callback.get("from", {})
         chat_id = callback.get("message", {}).get("chat", {}).get("id")
         choice = callback.get("data", "")
+
+        if user:
+            save_user(user)
 
         if callback_id:
             answer_callback(callback_id)
@@ -247,9 +322,10 @@ def telegram():
     return {"ok": True}
 
 
+# REGISTER WEBHOOK
 def setup_webhook():
     if not TOKEN or not BASE_URL:
-        print("Missing Telegram token or Render URL.")
+        print("Telegram token or Render URL is missing")
         return
 
     try:
@@ -259,6 +335,7 @@ def setup_webhook():
             timeout=15
         )
         print("Webhook setup:", response.text)
+
     except Exception as error:
         print("Webhook setup error:", error)
 
