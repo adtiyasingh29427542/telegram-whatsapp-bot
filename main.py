@@ -64,7 +64,6 @@ def setup_database():
         )
     """)
 
-    # Existing table mein extra column safely add karega.
     cur.execute("""
         ALTER TABLE user_states
         ADD COLUMN IF NOT EXISTS state_data TEXT
@@ -280,7 +279,6 @@ def read_contact_file(filename, file_bytes):
             read_only=True,
             data_only=True
         )
-
         sheet = workbook.active
         rows = list(sheet.iter_rows(values_only=True))
         workbook.close()
@@ -558,7 +556,6 @@ def set_campaign_audience(telegram_id, campaign_id, audience):
     conn = get_db()
     cur = conn.cursor()
 
-    # User ke apne contacts hi select honge.
     if audience == "all":
         cur.execute("""
             SELECT phone
@@ -650,7 +647,7 @@ def save_selected_audience(telegram_id, campaign_id, text_value):
     return saved, len(requested) - len(matched)
 
 
-# CAMPAIGN HISTORY
+# CAMPAIGN HISTORY WITH DETAILS BUTTONS
 def show_campaigns(chat_id, telegram_id):
     try:
         conn = get_db()
@@ -679,6 +676,7 @@ def show_campaigns(chat_id, telegram_id):
             return
 
         lines = ["📜 YOUR CAMPAIGN HISTORY\n"]
+        keyboard = []
 
         for campaign in campaigns:
             campaign_id, name, target, count, status, created = campaign
@@ -700,12 +698,99 @@ def show_campaigns(chat_id, telegram_id):
                 f"🗓 Date: {date_text}"
             )
 
+            keyboard.append([{
+                "text": f"🔍 View Details #{campaign_id}",
+                "callback_data": f"campaign_details_{campaign_id}"
+            }])
+
+        keyboard.append([{
+            "text": "⬅️ Main Menu",
+            "callback_data": "back_menu"
+        }])
+
         lines.append("\nShowing your 10 most recent campaigns.")
-        send_message(chat_id, "\n\n".join(lines))
+
+        send_message(
+            chat_id,
+            "\n\n".join(lines),
+            {"inline_keyboard": keyboard}
+        )
 
     except Exception as error:
         print("Campaign history error:", error)
         send_message(chat_id, "Campaign history load nahi ho paayi.")
+
+
+# SHOW ONE CAMPAIGN'S DETAILS
+def show_campaign_details(chat_id, telegram_id, campaign_id):
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+
+        # Ownership check: user can only see their own campaign.
+        cur.execute("""
+            SELECT id, campaign_name, message, target_type,
+                   recipient_count, status, created_at
+            FROM campaigns
+            WHERE id = %s AND telegram_id = %s
+        """, (campaign_id, telegram_id))
+
+        campaign = cur.fetchone()
+
+        cur.close()
+        conn.close()
+
+        if not campaign:
+            send_message(
+                chat_id,
+                "❌ Campaign nahi mila ya tumhe ise dekhne ki permission nahi hai."
+            )
+            return
+
+        cid, name, message, target, count, status, created = campaign
+
+        target_label = {
+            "all": "All Contacts",
+            "selected": "Selected Contacts",
+            "pending": "Audience Pending"
+        }.get(target, target)
+
+        date_text = created.strftime("%d-%m-%Y %H:%M") if created else "-"
+
+        details = (
+            "🔍 CAMPAIGN DETAILS\n\n"
+            f"🆔 Campaign ID: {cid}\n"
+            f"📌 Name: {name}\n\n"
+            "📝 MESSAGE:\n"
+            f"{message}\n\n"
+            "👥 AUDIENCE DETAILS:\n"
+            f"Audience: {target_label}\n"
+            f"Contacts: {count}\n\n"
+            "📊 CAMPAIGN STATUS:\n"
+            f"{status.upper()}\n\n"
+            f"🗓 Created: {date_text}\n\n"
+            "⚠️ Ye campaign abhi saved draft hai. "
+            "WhatsApp par message send nahi hua."
+        )
+
+        keyboard = {
+            "inline_keyboard": [
+                [{
+                    "text": "⬅️ Back to Campaign History",
+                    "callback_data": "history"
+                }],
+                [{
+                    "text": "🏠 Main Menu",
+                    "callback_data": "back_menu"
+                }]
+            ]
+        }
+
+        send_message(chat_id, details, keyboard)
+
+    except Exception as error:
+        print("Campaign details error:", error)
+        send_message(chat_id, "Campaign details load nahi ho paayi.")
 
 
 # CAMPAIGN AUDIENCE BUTTONS
@@ -738,6 +823,16 @@ def show_audience_options(chat_id, campaign_id):
 # CAMPAIGN CALLBACKS
 def handle_campaign_callback(chat_id, telegram_id, choice):
 
+    if choice.startswith("campaign_details_"):
+        try:
+            campaign_id = int(
+                choice.replace("campaign_details_", "", 1)
+            )
+            show_campaign_details(chat_id, telegram_id, campaign_id)
+        except ValueError:
+            send_message(chat_id, "❌ Invalid campaign ID.")
+        return True
+
     if choice.startswith("campaign_all_"):
         try:
             campaign_id = int(choice.replace("campaign_all_", "", 1))
@@ -757,7 +852,7 @@ def handle_campaign_callback(chat_id, telegram_id, choice):
                     chat_id,
                     "✅ CAMPAIGN SAVED SUCCESSFULLY!\n\n"
                     f"📱 Campaign ID: {campaign_id}\n"
-                    f"👥 Audience: All Contacts\n"
+                    "👥 Audience: All Contacts\n"
                     f"📥 Total Contacts: {count}\n"
                     "📊 Status: DRAFT\n\n"
                     "Campaign abhi sirf save hua hai. "
