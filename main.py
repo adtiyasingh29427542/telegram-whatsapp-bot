@@ -3,7 +3,10 @@ from flask import Flask, request
 import requests
 import os
 import re
+import csv
+import io
 import psycopg2
+from openpyxl import load_workbook
 
 app = Flask(__name__)
 
@@ -14,7 +17,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 API = f"https://api.telegram.org/bot{TOKEN}"
 
 
-# DATABASE CONNECTION
+# DATABASE
 def get_db():
     if not DATABASE_URL:
         raise Exception("DATABASE_URL is missing")
@@ -23,7 +26,6 @@ def get_db():
     return psycopg2.connect(db_url, connect_timeout=10)
 
 
-# CREATE TABLES
 def setup_database():
     conn = get_db()
     cur = conn.cursor()
@@ -67,7 +69,6 @@ def setup_database():
     print("Database tables are ready")
 
 
-# SAVE TELEGRAM CUSTOMER
 def save_user(user):
     try:
         conn = get_db()
@@ -93,7 +94,6 @@ def save_user(user):
         conn.commit()
         cur.close()
         conn.close()
-
         print("Customer saved:", user.get("id"))
         return True
 
@@ -152,7 +152,35 @@ def clear_state(telegram_id):
     conn.close()
 
 
-# ADD CONTACT
+# PHONE NUMBER CLEANING
+def clean_phone(value):
+    if value is None:
+        return None
+
+    phone = str(value).strip()
+
+    # Excel kabhi number ko 9.1987E+11 bana deta hai.
+    if isinstance(value, float) and value.is_integer():
+        phone = str(int(value))
+
+    phone = re.sub(r"[\s()-]", "", phone)
+
+    if phone.startswith("00"):
+        phone = "+" + phone[2:]
+
+    if phone.startswith("+"):
+        digits = phone[1:]
+    else:
+        digits = phone
+        phone = "+" + phone
+
+    if not digits.isdigit() or not (8 <= len(digits) <= 15):
+        return None
+
+    return phone
+
+
+# ADD ONE CONTACT
 def add_contact(telegram_id, name, phone):
     conn = get_db()
     cur = conn.cursor()
@@ -165,12 +193,206 @@ def add_contact(telegram_id, name, phone):
     """, (telegram_id, name, phone))
 
     result = cur.fetchone()
-
     conn.commit()
     cur.close()
     conn.close()
 
     return result is not None
+
+
+# BULK IMPORT CONTACTS
+def import_contacts(telegram_id, rows):
+    imported = 0
+    duplicates = 0
+    invalid = 0
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    try:
+        for name, raw_phone in rows:
+            name = str(name).strip() if name is not None else ""
+            phone = clean_phone(raw_phone)
+
+            if not name or len(name) > 80 or not phone:
+                invalid += 1
+                continue
+
+            cur.execute("""
+                INSERT INTO contacts (telegram_id, name, phone)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (telegram_id, phone) DO NOTHING
+                RETURNING id
+            """, (telegram_id, name, phone))
+
+            if cur.fetchone():
+                imported += 1
+            else:
+                duplicates += 1
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        cur.close()
+        conn.close()
+
+    return imported, duplicates, invalid
+
+
+# READ EXCEL / CSV
+def read_contact_file(filename, file_bytes):
+    extension = filename.lower().rsplit(".", 1)[-1]
+
+    rows = []
+
+    if extension == "xlsx":
+        workbook = load_workbook(
+            io.BytesIO(file_bytes),
+            read_only=True,
+            data_only=True
+        )
+
+        sheet = workbook.active
+
+        for row in sheet.iter_rows(values_only=True):
+            rows.append(row)
+
+        workbook.close()
+
+    elif extension == "csv":
+        text = file_bytes.decode("utf-8-sig")
+        reader = csv.reader(io.StringIO(text))
+        rows = list(reader)
+
+    else:
+        raise ValueError("Only XLSX and CSV files are supported.")
+
+    if not rows or len(rows) < 2:
+        raise ValueError("File mein contacts nahi mile.")
+
+    headers = [
+        str(value).strip().lower() if value is not None else ""
+        for value in rows[0]
+    ]
+
+    name_aliases = ["name", "contact name", "full name"]
+    phone_aliases = ["phone", "number", "mobile", "whatsapp", "phone number"]
+
+    name_index = next(
+        (i for i, h in enumerate(headers) if h in name_aliases),
+        None
+    )
+
+    phone_index = next(
+        (i for i, h in enumerate(headers) if h in phone_aliases),
+        None
+    )
+
+    if name_index is None or phone_index is None:
+        raise ValueError(
+            "File mein Name aur Phone columns zaroor hone chahiye."
+        )
+
+    for row in rows[1:]:
+        if len(row) <= max(name_index, phone_index):
+            continue
+
+        rows_data = (row[name_index], row[phone_index])
+
+        if any(value is not None for value in rows_data):
+            # Limit one upload to 5000 data rows.
+            if len(rows) > 5001:
+                raise ValueError("Ek file mein maximum 5000 rows allowed hain.")
+
+            yield rows_data
+
+
+# TELEGRAM FILE DOWNLOAD
+def download_telegram_file(file_id):
+    if not TOKEN:
+        raise Exception("Bot token missing.")
+
+    response = requests.get(
+        f"{API}/getFile",
+        params={"file_id": file_id},
+        timeout=20
+    )
+    response.raise_for_status()
+
+    result = response.json()
+
+    if not result.get("ok"):
+        raise Exception("Telegram file details nahi mil paaye.")
+
+    file_path = result["result"]["file_path"]
+
+    download_url = f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
+
+    file_response = requests.get(download_url, timeout=30)
+    file_response.raise_for_status()
+
+    if len(file_response.content) > 10 * 1024 * 1024:
+        raise ValueError("File 10 MB se chhoti honi chahiye.")
+
+    return file_response.content
+
+
+# HANDLE EXCEL UPLOAD
+def handle_document(chat_id, telegram_id, document):
+    filename = document.get("file_name", "")
+    extension = filename.lower().rsplit(".", 1)[-1]
+
+    if extension not in ["xlsx", "csv"]:
+        send_message(
+            chat_id,
+            "❌ Sirf .xlsx aur .csv files supported hain."
+        )
+        return
+
+    file_size = document.get("file_size", 0)
+
+    if file_size > 10 * 1024 * 1024:
+        send_message(chat_id, "❌ File 10 MB se chhoti honi chahiye.")
+        return
+
+    send_message(chat_id, "⏳ File process ho rahi hai. Please wait...")
+
+    try:
+        file_bytes = download_telegram_file(document["file_id"])
+        rows = list(read_contact_file(filename, file_bytes))
+
+        if len(rows) > 5000:
+            raise ValueError("Maximum 5000 contacts per file allowed hain.")
+
+        if not rows:
+            raise ValueError("File mein koi contact row nahi mili.")
+
+        imported, duplicates, invalid = import_contacts(
+            telegram_id,
+            rows
+        )
+
+        send_message(
+            chat_id,
+            "✅ EXCEL IMPORT COMPLETE!\n\n"
+            f"📥 Imported: {imported}\n"
+            f"♻️ Duplicate skipped: {duplicates}\n"
+            f"⚠️ Invalid skipped: {invalid}\n\n"
+            "Apne contacts dekhne ke liye View Contacts dabao."
+        )
+
+    except Exception as error:
+        print("Excel upload error:", error)
+        send_message(
+            chat_id,
+            "❌ File process nahi ho paayi.\n\n"
+            f"Reason: {str(error)[:300]}\n\n"
+            "Please template ke according file dobara bhejo."
+        )
 
 
 # GET CONTACTS
@@ -187,23 +409,19 @@ def get_contacts(telegram_id):
     """, (telegram_id,))
 
     contacts = cur.fetchall()
-
     cur.close()
     conn.close()
 
     return contacts
 
 
-# SEND MESSAGE
+# SEND TELEGRAM MESSAGE
 def send_message(chat_id, text, keyboard=None):
     if not TOKEN:
         print("TELEGRAM_BOT_TOKEN is missing")
         return
 
-    payload = {
-        "chat_id": chat_id,
-        "text": text
-    }
+    payload = {"chat_id": chat_id, "text": text}
 
     if keyboard:
         payload["reply_markup"] = keyboard
@@ -215,7 +433,6 @@ def send_message(chat_id, text, keyboard=None):
             timeout=15
         )
         print("Telegram sendMessage:", response.status_code)
-
     except Exception as error:
         print("Message error:", error)
 
@@ -271,7 +488,6 @@ def submenu(chat_id, title, buttons):
     send_message(chat_id, title, keyboard)
 
 
-# CONTACT MENU
 def contact_menu(chat_id):
     submenu(
         chat_id,
@@ -283,7 +499,6 @@ def contact_menu(chat_id):
     )
 
 
-# VIEW CONTACTS
 def show_contacts(chat_id, telegram_id):
     try:
         contacts = get_contacts(telegram_id)
@@ -291,8 +506,7 @@ def show_contacts(chat_id, telegram_id):
         if not contacts:
             send_message(
                 chat_id,
-                "📋 Abhi koi contact saved nahi hai.\n\n"
-                "Add Contacts par jaakar pehla contact add karo."
+                "📋 Abhi koi contact saved nahi hai."
             )
             return
 
@@ -302,15 +516,12 @@ def show_contacts(chat_id, telegram_id):
             name, phone = contact
             lines.append(f"{number}. {name}\n📱 {phone}")
 
-        lines.append(
-            "\nYahan tumhare 20 recent contacts dikhaye ja rahe hain."
-        )
-
+        lines.append("\nYahan 20 recent contacts dikhaye ja rahe hain.")
         send_message(chat_id, "\n\n".join(lines))
 
     except Exception as error:
         print("View contacts error:", error)
-        send_message(chat_id, "Contacts load nahi ho paaye. Please try again.")
+        send_message(chat_id, "Contacts load nahi ho paaye.")
 
 
 # BUTTON ACTIONS
@@ -330,16 +541,14 @@ def handle_choice(chat_id, telegram_id, choice):
         send_message(
             chat_id,
             "📱 WhatsApp Business selected!\n\n"
-            "Official Cloud API and eligible Coexistence setup will be added next. "
-            "No account has been connected yet."
+            "Official Cloud API setup will be added next."
         )
 
     elif choice == "personal_whatsapp":
         send_message(
             chat_id,
-            "💬 Normal WhatsApp selected!\n\n"
-            "Personal WhatsApp does not offer an official bulk messaging API. "
-            "We can store contacts, but cannot promise personal-account bulk sending."
+            "💬 Personal WhatsApp does not offer an official bulk messaging API. "
+            "Contacts can be stored, but personal-account bulk sending is not supported."
         )
 
     elif choice == "contacts":
@@ -350,7 +559,7 @@ def handle_choice(chat_id, telegram_id, choice):
         send_message(
             chat_id,
             "➕ ADD NEW CONTACT\n\n"
-            "Sabse pehle contact ka naam bhejo.\n\n"
+            "Contact ka naam bhejo.\n"
             "Example: Rahul Sharma\n\n"
             "Cancel karne ke liye /cancel bhejo."
         )
@@ -361,8 +570,14 @@ def handle_choice(chat_id, telegram_id, choice):
     elif choice == "excel":
         send_message(
             chat_id,
-            "📤 EXCEL UPLOAD\n\n"
-            "Excel contact upload feature next step mein banayenge."
+            "📤 EXCEL CONTACT UPLOAD\n\n"
+            "Apni .xlsx ya .csv file yahan bhejo.\n\n"
+            "File mein ye 2 columns hone chahiye:\n"
+            "Name | Phone\n\n"
+            "Example:\n"
+            "Name: Rahul Sharma\n"
+            "Phone: +919876543210\n\n"
+            "Maximum 5000 rows aur 10 MB file size."
         )
 
     elif choice == "broadcast":
@@ -378,7 +593,7 @@ def handle_choice(chat_id, telegram_id, choice):
     elif choice == "new_campaign":
         send_message(
             chat_id,
-            "🚀 Campaign creation will be connected after account and contact setup."
+            "🚀 Campaign creation will be connected after account setup."
         )
 
     elif choice == "autoreply":
@@ -421,7 +636,7 @@ def handle_choice(chat_id, telegram_id, choice):
     elif choice == "help":
         send_message(
             chat_id,
-            "❓ HELP & SUPPORT\n\nWelcome to My WP Broadcaster!\n\n"
+            "❓ HELP & SUPPORT\n\n"
             "Use the menu to explore the bot.\n"
             "Type /cancel to stop contact entry."
         )
@@ -434,7 +649,7 @@ def handle_choice(chat_id, telegram_id, choice):
         send_message(chat_id, "Please choose an option from the menu.")
 
 
-# HANDLE CONTACT ENTRY
+# MANUAL CONTACT ENTRY
 def handle_contact_message(chat_id, telegram_id, message_text):
     state_data = get_state(telegram_id)
 
@@ -447,10 +662,7 @@ def handle_contact_message(chat_id, telegram_id, message_text):
         name = message_text.strip()
 
         if len(name) < 2 or len(name) > 80:
-            send_message(
-                chat_id,
-                "Naam 2 se 80 characters ke beech hona chahiye. Dobara bhejo."
-            )
+            send_message(chat_id, "Naam 2 se 80 characters ke beech hona chahiye.")
             return True
 
         set_state(telegram_id, "waiting_phone", name)
@@ -459,29 +671,17 @@ def handle_contact_message(chat_id, telegram_id, message_text):
             chat_id,
             f"Name: {name}\n\n"
             "Ab WhatsApp number country code ke saath bhejo.\n"
-            "Example: +919876543210\n\n"
-            "Cancel karne ke liye /cancel bhejo."
+            "Example: +919876543210"
         )
         return True
 
     if state == "waiting_phone":
-        phone = re.sub(r"[\s()-]", "", message_text.strip())
+        phone = clean_phone(message_text)
 
-        if phone.startswith("00"):
-            phone = "+" + phone[2:]
-
-        if phone.startswith("+"):
-            digits = phone[1:]
-        else:
-            digits = phone
-            phone = "+" + phone
-
-        if not digits.isdigit() or not (8 <= len(digits) <= 15):
+        if not phone:
             send_message(
                 chat_id,
-                "❌ Number sahi nahi lag raha.\n"
-                "Country code ke saath bhejo.\n"
-                "Example: +919876543210"
+                "❌ Number sahi nahi hai. Example: +919876543210"
             )
             return True
 
@@ -497,18 +697,12 @@ def handle_contact_message(chat_id, telegram_id, message_text):
                     f"📱 Number: {phone}"
                 )
             else:
-                send_message(
-                    chat_id,
-                    "⚠️ Ye number tumhare contacts mein pehle se saved hai."
-                )
+                send_message(chat_id, "⚠️ Ye number pehle se saved hai.")
 
         except Exception as error:
             print("Add contact error:", error)
             clear_state(telegram_id)
-            send_message(
-                chat_id,
-                "Contact save nahi ho paaya. Please dobara try karo."
-            )
+            send_message(chat_id, "Contact save nahi ho paaya.")
 
         return True
 
@@ -531,14 +725,21 @@ def telegram():
 
     if message:
         chat_id = message.get("chat", {}).get("id")
-        message_text = message.get("text", "")
         user = message.get("from", {})
         telegram_id = user.get("id")
+        message_text = message.get("text", "")
 
         if telegram_id:
             save_user(user)
 
-        if chat_id and message_text:
+        if chat_id and message.get("document") and telegram_id:
+            handle_document(
+                chat_id,
+                telegram_id,
+                message["document"]
+            )
+
+        elif chat_id and message_text:
             if message_text in ["/start", "/menu"]:
                 if telegram_id:
                     clear_state(telegram_id)
@@ -579,7 +780,7 @@ def telegram():
     return {"ok": True}
 
 
-# REGISTER WEBHOOK
+# WEBHOOK SETUP
 def setup_webhook():
     if not TOKEN or not BASE_URL:
         print("Telegram token or Render URL is missing")
