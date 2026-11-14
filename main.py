@@ -20,11 +20,25 @@ def send_message(chat_id, text, keyboard=None):
     if keyboard:
         payload["reply_markup"] = keyboard
 
-    requests.post(
-        f"{API}/sendMessage",
-        json=payload,
-        timeout=15
-    )
+    try:
+        requests.post(
+            f"{API}/sendMessage",
+            json=payload,
+            timeout=15
+        )
+    except Exception as error:
+        print("Message error:", error)
+
+
+def answer_callback(callback_id):
+    try:
+        requests.post(
+            f"{API}/answerCallbackQuery",
+            json={"callback_query_id": callback_id},
+            timeout=15
+        )
+    except Exception as error:
+        print("Callback error:", error)
 
 
 def main_menu(chat_id):
@@ -51,14 +65,150 @@ def main_menu(chat_id):
 
     send_message(
         chat_id,
-        "Welcome to My WP Broadcaster Bot! ❤️\n\nChoose an option:",
+        "❤️ Welcome to My WP Broadcaster!\n\nChoose an option:",
         keyboard
     )
 
 
+def submenu(chat_id, title, buttons):
+    keyboard = {
+        "inline_keyboard": buttons + [
+            [{"text": "⬅️ Main Menu", "callback_data": "back_menu"}]
+        ]
+    }
+    send_message(chat_id, title, keyboard)
+
+
+def handle_choice(chat_id, choice):
+
+    if choice == "accounts":
+        submenu(
+            chat_id,
+            "📱 WHATSAPP ACCOUNTS\n\nChoose your account type:",
+            [
+                [{"text": "WhatsApp Business App", "callback_data": "business_app"}],
+                [{"text": "Normal WhatsApp", "callback_data": "personal_whatsapp"}]
+            ]
+        )
+
+    elif choice == "business_app":
+        send_message(
+            chat_id,
+            "📱 WhatsApp Business selected!\n\nOfficial Cloud API and eligible Coexistence connection setup will be added next.\n\nNo account has been connected yet."
+        )
+
+    elif choice == "personal_whatsapp":
+        send_message(
+            chat_id,
+            "💬 Normal WhatsApp selected!\n\nPersonal WhatsApp does not offer an official bulk messaging API. We can use personal WhatsApp numbers as contact recipients, but cannot promise official personal-account bulk sending."
+        )
+
+    elif choice == "contacts":
+        submenu(
+            chat_id,
+            "👥 CONTACT MANAGEMENT\n\nChoose an option:",
+            [
+                [{"text": "➕ Add Contact", "callback_data": "add_contact"}],
+                [{"text": "📋 View Contacts", "callback_data": "view_contacts"}]
+            ]
+        )
+
+    elif choice == "add_contact":
+        send_message(
+            chat_id,
+            "➕ ADD CONTACT\n\nContact entry and consent verification will be set up next."
+        )
+
+    elif choice == "view_contacts":
+        send_message(
+            chat_id,
+            "📋 Your contact database is not configured yet."
+        )
+
+    elif choice == "excel":
+        send_message(
+            chat_id,
+            "📤 EXCEL UPLOAD\n\nSend an Excel file (.xlsx) in a future upload step. File processing is not active yet."
+        )
+
+    elif choice == "broadcast":
+        submenu(
+            chat_id,
+            "🚀 CREATE BROADCAST\n\nChoose a campaign option:",
+            [
+                [{"text": "✍️ Create New Campaign", "callback_data": "new_campaign"}],
+                [{"text": "📊 Campaign Status", "callback_data": "history"}]
+            ]
+        )
+
+    elif choice == "new_campaign":
+        send_message(
+            chat_id,
+            "🚀 NEW CAMPAIGN\n\nCampaign creation will be connected after WhatsApp account and contact setup."
+        )
+
+    elif choice == "autoreply":
+        submenu(
+            chat_id,
+            "🤖 AUTO REPLY\n\nChoose an option:",
+            [
+                [{"text": "➕ Add Auto Reply", "callback_data": "add_reply"}],
+                [{"text": "📋 View Auto Replies", "callback_data": "view_replies"}]
+            ]
+        )
+
+    elif choice == "add_reply":
+        send_message(
+            chat_id,
+            "🤖 Add Auto Reply feature will be configured next."
+        )
+
+    elif choice == "view_replies":
+        send_message(
+            chat_id,
+            "📋 No auto replies configured yet."
+        )
+
+    elif choice == "credits":
+        submenu(
+            chat_id,
+            "💳 CREDITS & PLANS\n\nSubscription plans will be available here:",
+            [
+                [{"text": "🥉 Basic Plan", "callback_data": "basic_plan"}],
+                [{"text": "🥈 Pro Plan", "callback_data": "pro_plan"}],
+                [{"text": "🥇 Business Plan", "callback_data": "business_plan"}]
+            ]
+        )
+
+    elif choice in ["basic_plan", "pro_plan", "business_plan"]:
+        send_message(
+            chat_id,
+            "💳 Plan selected: " + choice.replace("_", " ").title()
+            + "\n\nPayment and credit system will be connected later."
+        )
+
+    elif choice == "history":
+        send_message(
+            chat_id,
+            "📜 CAMPAIGN HISTORY\n\nYour campaign database is not configured yet."
+        )
+
+    elif choice == "help":
+        send_message(
+            chat_id,
+            "❓ HELP & SUPPORT\n\nWelcome to My WP Broadcaster!\n\nUse the main menu to explore the bot. More features are coming soon."
+        )
+
+    elif choice == "back_menu":
+        main_menu(chat_id)
+
+    else:
+        send_message(chat_id, "Please choose an option from the menu.")
+
+
 @app.route("/")
 def home():
-    return "WhatsApp Telegram Bot is Running!"
+    return "My WP Broadcaster Bot is Running!"
 
 
 @app.route("/telegram", methods=["POST"])
@@ -75,10 +225,12 @@ def telegram():
         if chat_id and text:
             if text == "/start":
                 main_menu(chat_id)
+            elif text == "/menu":
+                main_menu(chat_id)
             else:
                 send_message(
                     chat_id,
-                    "Please choose an option from the menu.",
+                    "Please use the menu buttons or type /menu."
                 )
 
     if callback:
@@ -86,43 +238,29 @@ def telegram():
         chat_id = callback.get("message", {}).get("chat", {}).get("id")
         choice = callback.get("data", "")
 
-        requests.post(
-            f"{API}/answerCallbackQuery",
-            json={"callback_query_id": callback_id},
-            timeout=15
-        )
-
-        options = {
-            "accounts": "WhatsApp Accounts: Account connection feature is coming soon.",
-            "contacts": "Add Contacts: Contact management is coming soon.",
-            "excel": "Excel Upload: Excel import is coming soon.",
-            "broadcast": "Create Broadcast: Campaign feature is coming soon.",
-            "autoreply": "Auto Reply: Auto reply feature is coming soon.",
-            "credits": "Credits & Plans: Subscription feature is coming soon.",
-            "history": "Campaign History: History feature is coming soon.",
-            "help": "Help: Contact support for assistance."
-        }
+        if callback_id:
+            answer_callback(callback_id)
 
         if chat_id:
-            send_message(
-                chat_id,
-                options.get(choice, "Please choose an option.")
-            )
+            handle_choice(chat_id, choice)
 
     return {"ok": True}
 
 
 def setup_webhook():
-    if TOKEN and BASE_URL:
-        try:
-            response = requests.post(
-                f"{API}/setWebhook",
-                json={"url": BASE_URL.rstrip("/") + "/telegram"},
-                timeout=15
-            )
-            print("Webhook setup:", response.text)
-        except Exception as error:
-            print("Webhook error:", error)
+    if not TOKEN or not BASE_URL:
+        print("Missing Telegram token or Render URL.")
+        return
+
+    try:
+        response = requests.post(
+            f"{API}/setWebhook",
+            json={"url": BASE_URL.rstrip("/") + "/telegram"},
+            timeout=15
+        )
+        print("Webhook setup:", response.text)
+    except Exception as error:
+        print("Webhook setup error:", error)
 
 
 setup_webhook()
